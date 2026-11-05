@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>AIR//INK 3D</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:'Courier New',monospace;color:#00ff9c;}
+  
+  #video{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1);z-index:1;transition:transform .3s;}
+  #video.no-mirror{transform:scaleX(1);}
+  
+  #three-canvas{position:fixed;inset:0;width:100%;height:100%;z-index:2;pointer-events:none;}
+  #hud-canvas{position:fixed;inset:0;width:100%;height:100%;z-index:3;pointer-events:none;}
+
+  .vignette{position:fixed;inset:0;pointer-events:none;z-index:4;box-shadow:inset 0 0 100px 20px rgba(0,0,0,0.8);}
+  .scanlines{position:fixed;inset:0;pointer-events:none;z-index:5;opacity:.3;background:repeating-linear-gradient(0deg, rgba(0,0,0,.6) 0px, rgba(0,0,0,.6) 1px, transparent 1px, transparent 3px);}
+
+  .topbar{position:fixed;top:0;left:0;right:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:15px;direction:ltr;background:linear-gradient(180deg,rgba(0,0,0,.8),rgba(0,0,0,0));}
+  
+  .btn{font-family:inherit;font-size:12px;font-weight:bold;color:#00ff9c;background:rgba(0,20,12,.7);border:1px solid #00ff9c;padding:10px 15px;border-radius:4px;cursor:pointer;backdrop-filter:blur(5px);box-shadow:0 0 10px rgba(0,255,156,.2);}
+  .btn:active{transform:scale(.95);}
+  .btn.accent{color:#ff4060;border-color:#ff4060;box-shadow:0 0 10px rgba(255,64,96,.2);}
+
+  #loader{position:fixed;inset:0;z-index:50;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:15px;transition:opacity .5s;}
+  #loader.hidden{opacity:0;pointer-events:none;}
+  .ring{width:50px;height:50px;border-radius:50%;border:2px solid rgba(0,255,156,.1);border-top-color:#00ff9c;animation:spin 1s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  #loadMsg{font-size:12px;letter-spacing:2px;color:#00ff9c;text-align:center;padding:0 20px;}
+</style>
+</head>
+<body>
+
+<video id="video" autoplay muted playsinline></video>
+<canvas id="three-canvas"></canvas>
+<canvas id="hud-canvas"></canvas>
+
+<div class="vignette"></div>
+<div class="scanlines"></div>
+
+<div class="topbar">
+  <button id="clearBtn" class="btn">CLEAR</button>
+  <button id="switchBtn" class="btn accent">⟲ CAM</button>
+</div>
+
+<div id="loader">
+  <div class="ring"></div>
+  <div id="loadMsg">در حال راه‌اندازی سنسورها...</div>
+</div>
+
+<!-- MediaPipe برای تشخیص دست -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { DeviceOrientationControls } from 'three/addons/controls/DeviceOrientationControls.js';
+import { Line2 } from 'three/addons/lines/Line2.js';
+import { LineGeometry } from 'three/addons/lines/LineGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+
+/* ============ DOM Elements ============ */
+const video = document.getElementById('video');
+const hudCanvas = document.getElementById('hud-canvas');
+const hctx = hudCanvas.getContext('2d');
+const loader = document.getElementById('loader');
+const loadMsg = document.getElementById('loadMsg');
+
+let W = window.innerWidth, H = window.innerHeight;
+
+/* ============ Three.js Setup (3D Scene) ============ */
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, W / H, 0.1, 100);
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('three-canvas'), alpha: true, antialias: true });
+renderer.setSize(W, H);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+// متریال خط (قرمز ضخیم و درخشان)
+const matLine = new LineMaterial({
+  color: 0xff1a3c,
+  linewidth: 12, // ضخامت خط به پیکسل
+  resolution: new THREE.Vector2(W, H),
+  dashed: false,
+  alphaToCoverage: true,
+  blending: THREE.AdditiveBlending,
+  depthTest: false
+});
+
+let strokes = []; // آرایه نگهداری خطوط
+let currentLine = null;
+let currentPoints = [];
+
+/* ============ Gyroscope Controls ============ */
+let controls = new DeviceOrientationControls(camera);
+let gyroActive = false;
+
+function initGyro() {
+  if (gyroActive) return;
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      // iOS
+      DeviceOrientationEvent.requestPermission().then(permissionState => {
+        if (permissionState === 'granted') {
+          controls.connect();
+          gyroActive = true;
+        }
+      }).catch(console.error);
+    } else {
+      // Android
+      controls.connect();
+      gyroActive = true;
+    }
+  } catch(e) { console.warn(e); }
+}
+
+/* ============ Camera Setup ============ */
+let facingMode = 'user';
+let stream = null;
+let mirrored = true;
+
+async function initCamera(mode) {
+  facingMode = mode;
+  mirrored = (mode === 'user');
+  video.classList.toggle('no-mirror', !mirrored);
+
+  if (stream) stream.getTracks().forEach(t => t.stop());
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: mode } }
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    console.error("Camera error:", e);
+  }
+}
+
+/* ============ MediaPipe Hands Setup ============ */
+let handsModel = null;
+const handsState = { active: false, smooth: null, stroke: null };
+
+function initMediaPipe() {
+  if (typeof Hands === 'undefined') {
+    loadMsg.textContent = "خطا: اینترنت برای دانلود هوش مصنوعی وصل نیست.";
+    return;
+  }
+
+  handsModel = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+  });
+
+  handsModel.setOptions({
+    maxNumHands: 1,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.6,
+    minTrackingConfidence: 0.6
+  });
+
+  handsModel.onResults(onResults);
+  
+  // شروع پردازش
+  setInterval(() => {
+    if (video.readyState >= 2 && video.videoWidth > 0) {
+      handsModel.send({ image: video }).catch(() => {});
+    }
+  }, 1000 / 30); // 30fps
+  
+  setTimeout(() => loader.classList.add('hidden'), 2000);
+}
+
+/* ============ Hand Processing & 3D Drawing ============ */
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+
+function onResults(res) {
+  hctx.clearRect(0, 0, W, H);
+  
+  const hands = res.multiHandLandmarks || [];
+  if (hands.length === 0) {
+    handsState.active = false;
+    handsState.stroke = null;
+    return;
+  }
+
+  const lm = hands[0]; // فقط اولین دست
+  
+  // رسم اسکلت دست روی HUD
+  drawSkeleton(lm, handsState.active);
+
+  // تشخیص چسبیدن شست و اشاره
+  const thumb = lm[4];
+  const index = lm[8];
+  const palm = lm[9];
+  const wrist = lm[0];
+  
+  const dist = Math.hypot(thumb.x - index.x, thumb.y - index.y);
+  const palmSize = Math.hypot(wrist.x - palm.x, wrist.y - palm.y) || 0.1;
+  const ratio = dist / palmSize;
+
+  if (!handsState.active && ratio < 0.4) handsState.active = true;
+  if (handsState.active && ratio > 0.6) handsState.active = false;
+
+  // مختصات وسط شست و اشاره
+  const tipX = (thumb.x + index.x) / 2;
+  const tipY = (thumb.y + index.y) / 2;
+
+  if (handsState.active) {
+    // تبدیل مختصات ۲بعدی به ۳بعدی در فضا
+    // x و y را به NDC (محدوده -۱ تا ۱) تبدیل می‌کنیم
+    ndc.x = (mirrored ? (1 - tipX) : tipX) * 2 - 1;
+    ndc.y = -(tipY * 2 - 1);
+
+    raycaster.setFromCamera(ndc, camera);
+    
+    // نقطه‌ای در فاصله ۲ متری از دوربین در فضا
+    const targetZ = -2.0; 
+    const p3d = raycaster.ray.at(2.0, new THREE.Vector3());
+    // اصلاح برای جلوگیری از پرش‌های ناگهانی
+    if (Math.abs(p3d.z) > 5) p3d.z = targetZ;
+
+    if (!handsState.smooth) handsState.smooth = p3d.clone();
+    else handsState.smooth.lerp(p3d, 0.4); // نرم کردن حرکت
+
+    draw3DLine(handsState.smooth);
+  } else {
+    handsState.smooth = null;
+    handsState.stroke = null;
+  }
+}
+
+/* ============ رسم خط ۳ بعدی ============ */
+function draw3DLine(point) {
+  if (!currentLine) {
+    const geo = new LineGeometry();
+    currentLine = new Line2(geo, matLine);
+    currentLine.frustumCulled = false;
+    scene.add(currentLine);
+    strokes.push(currentLine);
+    currentPoints = [point.x, point.y, point.z];
+  } else {
+    const lastP = new THREE.Vector3(
+      currentPoints[currentPoints.length-3],
+      currentPoints[currentPoints.length-2],
+      currentPoints[currentPoints.length-1]
+    );
+    // حداقل فاصله برای کشیدن نقطه جدید
+    if (lastP.distanceTo(point) > 0.01) {
+      currentPoints.push(point.x, point.y, point.z);
+      currentLine.geometry.setPositions(currentPoints);
+    }
+  }
+}
+
+/* ============ رسم اسکلت دست (HUD) ============ */
+const conn = typeof HAND_CONNECTIONS !== 'undefined' ? HAND_CONNECTIONS : [];
+function drawSkeleton(lm, active) {
+  const getPt = (p) => {
+    let x = p.x * W;
+    if (mirrored) x = W - x;
+    return { x, y: p.y * H };
+  };
+
+  hctx.save();
+  hctx.setLineDash([2, 4]);
+  hctx.lineWidth = 1.5;
+  hctx.strokeStyle = active ? 'rgba(255,60,90,0.9)' : 'rgba(0,255,156,0.6)';
+  hctx.shadowColor = hctx.strokeStyle;
+  hctx.shadowBlur = 5;
+
+  for (let c = 0; c < conn.length; c++) {
+    const p1 = getPt(lm[conn[c][0]]);
+    const p2 = getPt(lm[conn[c][1]]);
+    hctx.beginPath(); hctx.moveTo(p1.x, p1.y); hctx.lineTo(p2.x, p2.y); hctx.stroke();
+  }
+
+  hctx.setLineDash([]);
+  for (let j = 0; j < lm.length; j++) {
+    const p = getPt(lm[j]);
+    hctx.beginPath();
+    hctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+    hctx.fillStyle = active ? '#ff3a5e' : '#00ff9c';
+    hctx.fill();
+  }
+  hctx.restore();
+}
+
+/* ============ حلقه رندر (Render Loop) ============ */
+function animate() {
+  requestAnimationFrame(animate);
+  
+  if (gyroActive) {
+    controls.update(); // چرخش دوربین با ژیروسکوپ
+  }
+  
+  renderer.render(scene, camera);
+}
+
+/* ============ Resize ============ */
+window.addEventListener('resize', () => {
+  W = window.innerWidth; H = window.innerHeight;
+  camera.aspect = W / H;
+  camera.updateProjectionMatrix();
+  renderer.setSize(W, H);
+  matLine.resolution.set(W, H);
+  hudCanvas.width = W;
+  hudCanvas.height = H;
+});
+hudCanvas.width = W;
+hudCanvas.height = H;
+
+/* ============ دکمه‌ها ============ */
+document.getElementById('clearBtn').addEventListener('click', () => {
+  strokes.forEach(line => {
+    scene.remove(line);
+    line.geometry.dispose();
+  });
+  strokes = [];
+  currentLine = null;
+  currentPoints = [];
+});
+
+document.getElementById('switchBtn').addEventListener('click', () => {
+  initCamera(facingMode === 'user' ? 'environment' : 'user');
+});
+
+/* ============ شروع ============ */
+// گرفتن اجازه ژیروسکوپ نیاز به لمس کاربر دارد
+document.body.addEventListener('click', initGyro, { once: true });
+document.body.addEventListener('touchstart', initGyro, { once: true });
+
+initCamera('user').then(() => {
+  initMediaPipe();
+  animate();
+});
+</script>
+</body>
+</html>
